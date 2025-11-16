@@ -1,0 +1,35 @@
+# Example scanner-suggestion.toml for Scanner
+
+[[checks]]
+name = "python-lint"
+command = ["uvx", "ruff", "check"]
+env = {}
+timeout = 30
+enabled = true
+tags = ["backend", "lint"]
+
+[[checks]]
+name = "python-typecheck"
+command = ["uvx", "ty", "check"]
+env = {}
+timeout = 30
+enabled = true
+tags = ["backend", "typecheck"]
+
+[[checks]]
+name = "javascript-lint"
+command = ["bunx", "oxlint@latest"]
+env = { VERSION = "1" }
+timeout = 30
+enabled = true
+tags = ["frontend", "lint"]
+
+[[checks]]
+name = "javascript-typecheck"
+command = ["bunx", "@typescript/native-preview", "--noEmit"]
+formatter = ["tsc-output-format", "--outputFormat", "gh"]
+env = {}
+timeout = 30
+enabled = true
+tags = ["frontend", "typecheck"]
+
