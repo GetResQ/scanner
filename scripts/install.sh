@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OWNER=${GITHUB_OWNER:-mazdak}
+OWNER=${GITHUB_OWNER:-getresq}
 REPO=${GITHUB_REPO:-scanner}
 INSTALL_DIR=${SCANNER_INSTALL_DIR:-$HOME/.local/bin}
 TARGET_TRIPLE=${SCANNER_TARGET_TRIPLE:-}
@@ -18,15 +18,21 @@ detect_target() {
   uname_m="$(uname -m)"
 
   case "$uname_s" in
-    Darwin) platform="apple-darwin" ;;
-    Linux) platform="unknown-linux-gnu" ;;
-    *) echo "error: unsupported OS '$uname_s'" >&2; exit 1 ;;
+  Darwin) platform="apple-darwin" ;;
+  Linux) platform="unknown-linux-gnu" ;;
+  *)
+    echo "error: unsupported OS '$uname_s'" >&2
+    exit 1
+    ;;
   esac
 
   case "$uname_m" in
-    x86_64) arch="x86_64" ;;
-    arm64|aarch64) arch="aarch64" ;;
-    *) echo "error: unsupported architecture '$uname_m'" >&2; exit 1 ;;
+  x86_64) arch="x86_64" ;;
+  arm64 | aarch64) arch="aarch64" ;;
+  *)
+    echo "error: unsupported architecture '$uname_m'" >&2
+    exit 1
+    ;;
   esac
 
   TARGET_TRIPLE="${arch}-${platform}"
@@ -59,9 +65,9 @@ curl -fsSL "$ASSET_URL" -o "$DOWNLOAD_PATH"
 EXTRACT_DIR="$TMPDIR/extracted"
 mkdir -p "$EXTRACT_DIR"
 case "$ASSET_NAME" in
-  *.tar.gz|*.tgz) tar -xzf "$DOWNLOAD_PATH" -C "$EXTRACT_DIR" ;;
-  *.zip) unzip -q "$DOWNLOAD_PATH" -d "$EXTRACT_DIR" ;;
-  *) mv "$DOWNLOAD_PATH" "$EXTRACT_DIR/";;
+*.tar.gz | *.tgz) tar -xzf "$DOWNLOAD_PATH" -C "$EXTRACT_DIR" ;;
+*.zip) unzip -q "$DOWNLOAD_PATH" -d "$EXTRACT_DIR" ;;
+*) mv "$DOWNLOAD_PATH" "$EXTRACT_DIR/" ;;
 esac
 
 BINARY_PATH=$(find "$EXTRACT_DIR" -type f -name scanner -perm -111 -print -quit)

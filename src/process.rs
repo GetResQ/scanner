@@ -18,11 +18,16 @@ pub async fn run_command(
     timeout: Option<Duration>,
     stdin: Option<Vec<u8>>,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+    let wants_stdin = stdin.is_some();
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
         .envs(env)
         .current_dir(root)
-        .stdin(Stdio::piped())
+        .stdin(if wants_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -31,6 +36,7 @@ pub async fn run_command(
     if let Some(input) = stdin {
         if let Some(mut child_stdin) = child.stdin.take() {
             child_stdin.write_all(&input).await?;
+            child_stdin.shutdown().await?;
         }
     }
 

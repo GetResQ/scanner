@@ -11,7 +11,7 @@ the user can specify a customer formatter.
 
 ## Install (pre-built binaries)
 ```bash
-curl -sSL https://raw.githubusercontent.com/mazdak/scanner/refs/heads/master/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/getresq/scanner/refs/heads/master/scripts/install.sh | bash
 ```
 
 ## Build from source (Rust)
