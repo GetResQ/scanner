@@ -1,35 +1,41 @@
-# Example scanner-suggestion.toml for Scanner
+# scanner.toml for Rust project
+[agents.analyzer]
+command = ["codex", "exec", "--model", "gpt-5.1-codex-mini", "-c", "model_reasoning_effort=\"medium\"", "--json", "--skip-git-repo-check", "-"]
+
+[agents.fixer]
+command = ["codex", "exec", "--model", "gpt-5.1-codex-mini", "-c", "model_reasoning_effort=\"medium\"", "--dangerously-bypass-approvals-and-sandbox", "--json", "--skip-git-repo-check", "-"]
+
 
 [[checks]]
-name = "python-lint"
-command = ["uvx", "ruff", "check"]
+name = "rust-check"
+command = ["cargo", "check", "--message-format=json"]
+formatter = ["./scripts/cargo-to-gha.sh"]
+env = {}
+timeout = 120
+enabled = true
+tags = ["rust", "compile"]
+
+[[checks]]
+name = "rust-clippy"
+command = ["cargo", "clippy", "--message-format=json", "--", "-D", "warnings"]
+formatter = ["./scripts/cargo-to-gha.sh"]
+env = {}
+timeout = 120
+enabled = true
+tags = ["rust", "lint"]
+
+[[checks]]
+name = "rust-fmt"
+command = ["cargo", "fmt", "--check"]
 env = {}
 timeout = 30
 enabled = true
-tags = ["backend", "lint"]
+tags = ["rust", "format"]
 
 [[checks]]
-name = "python-typecheck"
-command = ["uvx", "ty", "check"]
+name = "rust-test"
+command = ["cargo", "test"]
 env = {}
-timeout = 30
+timeout = 300
 enabled = true
-tags = ["backend", "typecheck"]
-
-[[checks]]
-name = "javascript-lint"
-command = ["bunx", "oxlint@latest"]
-env = { VERSION = "1" }
-timeout = 30
-enabled = true
-tags = ["frontend", "lint"]
-
-[[checks]]
-name = "javascript-typecheck"
-command = ["bunx", "@typescript/native-preview", "--noEmit"]
-formatter = ["tsc-output-format", "--outputFormat", "gh"]
-env = {}
-timeout = 30
-enabled = true
-tags = ["frontend", "typecheck"]
-
+tags = ["rust", "test"]

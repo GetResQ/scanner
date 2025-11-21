@@ -1,6 +1,6 @@
 [package]
 name = "scanner-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
@@ -13,7 +13,6 @@ clap = { version = "4.5.52", features = ["derive"] }
 crossterm = "0.29.0"
 num_cpus = "1.17.0"
 ratatui = "0.29.0"
-regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "sync"] }
 toml = "0.9.8"
@@ -22,3 +21,5 @@ atty = "0.2.14"
 which = "6.0.1"
 dirs = "5.0.1"
 arboard = "3.4.0"
+tokio-util = "0.7"
+thiserror = "2.0"

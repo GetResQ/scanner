@@ -1,15 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use atty;
-use num_cpus;
 
 use crate::Cli;
 use crate::agents::resolve_agent;
 use crate::config;
 use crate::demo;
+use crate::error::{CliError, ConfigError};
 use crate::fix;
 use crate::gha;
+use crate::pool::Pool;
 use crate::runner;
 use crate::ui;
 
@@ -43,11 +43,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         PathBuf::from("scanner.toml")
     };
 
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| ConfigError::ReadFailed {
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
 
-    let cfg = config::Config::from_toml(&raw)
-        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    let cfg = config::Config::from_toml(&raw).map_err(|e| ConfigError::ParseFailed {
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
 
     let root = compute_root(&cli, &config_path)?;
 
@@ -57,155 +61,147 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Demo { .. }) => unreachable!(),
     };
 
-    let workers = effective_workers(cli.workers);
+    // Create the shared pool
+    let pool = Pool::new(cli.workers);
 
-    let use_tui = !cli.quiet && atty::is(atty::Stream::Stdout);
-    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui);
+    let use_tui = cli.tui && atty::is(atty::Stream::Stdout);
+    let use_color = !cli.quiet && atty::is(atty::Stream::Stderr);
+    let verbose = cli.verbose;
+    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, use_color, verbose, pool.clone());
 
-    let check_results = runner::run_checks(
-        &cfg,
-        &filters,
-        cli.force,
-        workers,
-        cli.quiet,
-        ui_tx.clone(),
-        &root,
-    )
-    .await?;
+    let result: Result<()> = async {
+        let check_results = runner::run_checks(
+            &cfg,
+            &filters,
+            cli.force,
+            &pool,
+            false,
+            ui_tx.clone(),
+            &root,
+        )
+        .await;
 
-    let failures: Vec<_> = check_results
-        .iter()
-        .filter(|res| {
-            res.exit_code != Some(0) || res.annotations.iter().any(|a| gha::is_error_level(a.level))
-        })
-        .collect();
-
-    if failures.is_empty() {
-        if let Some(tx) = ui_tx {
-            let _ = tx.send(ui::UiEvent::Done).await;
+        if check_results.is_empty() {
+            return Err(CliError::NoMatchingChecks {
+                filters: filters.clone(),
+            }
+            .into());
         }
-        let _ = ui_handle.await;
-        return Ok(());
-    }
 
-    if cli.dry_run || cli.no_fix {
-        if let Some(tx) = ui_tx {
-            let _ = tx.send(ui::UiEvent::Done).await;
+        let failures: Vec<_> = check_results
+            .iter()
+            .filter(|res| {
+                res.exit_code != Some(0)
+                    || res.annotations.iter().any(|a| gha::is_error_level(a.level))
+            })
+            .collect();
+
+        if failures.is_empty() {
+            return Ok(());
         }
-        let _ = ui_handle.await;
-        let reason = if cli.dry_run { "dry-run" } else { "no-fix" };
-        anyhow::bail!("checks failed ({}; no fixes attempted)", reason);
-    }
 
-    let analyzer = resolve_agent("analyzer", &cli, &cfg)?;
-    let fixer = resolve_agent("fixer", &cli, &cfg)?;
+        if cli.dry_run || cli.no_fix {
+            let reason = if cli.dry_run { "dry-run" } else { "no-fix" };
+            return Err(CliError::ChecksFailed {
+                count: failures.len(),
+                reason: reason.to_string(),
+            }
+            .into());
+        }
 
-    let error_groups = fix::group_errors(&check_results);
-    if error_groups.is_empty() {
-        anyhow::bail!("checks failed but no actionable error groups were produced");
-    }
+        let analyzer = resolve_agent("analyzer", &cli, &cfg)?;
+        let fixer = resolve_agent("fixer", &cli, &cfg)?;
 
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckStarted {
-                name: "analyzer".into(),
-                desc: Some("Analyze failures".into()),
+        // Group errors by check type
+        let errors_by_check = fix::group_errors_by_check(&check_results);
+        if errors_by_check.is_empty() {
+            return Err(CliError::ChecksFailed {
+                count: failures.len(),
+                reason: "no actionable GitHub Actions annotations (configure a formatter or update tool output)".to_string(),
+            }
+            .into());
+        }
+
+        // Run the fix pipeline: each check gets its own analyzer -> fixer(s)
+        fix::run_fix_pipeline(
+            &analyzer,
+            &fixer,
+            &errors_by_check,
+            cli.batch_size,
+            &pool,
+            &root,
+            ui_tx.clone(),
+        )
+        .await?;
+
+        // Re-run checks once after fixes
+        let post_results = runner::run_checks(
+            &cfg,
+            &filters,
+            cli.force,
+            &pool,
+            false,
+            ui_tx.clone(),
+            &root,
+        )
+        .await;
+
+        let remaining: Vec<_> = post_results
+            .iter()
+            .filter(|res| {
+                res.exit_code != Some(0)
+                    || res.annotations.iter().any(|a| gha::is_error_level(a.level))
             })
-            .await;
-    }
-    let analysis = fix::run_analyzer(&analyzer, &error_groups, &root).await?;
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckFinished {
-                name: "analyzer".into(),
-                success: true,
-                message: "done".into(),
-                output: Some(analysis.clone()),
-            })
-            .await;
-    }
+            .collect();
 
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckStarted {
-                name: "fixer".into(),
-                desc: Some("Apply fixes".into()),
-            })
-            .await;
-    }
-    fix::run_fixer_batches(
-        &fixer,
-        &analysis,
-        &error_groups,
-        cli.batch_size,
-        workers,
-        &root,
-    )
-    .await?;
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckFinished {
-                name: "fixer".into(),
-                success: true,
-                message: "applied".into(),
-                output: Some("Applied fixes.".into()),
-            })
-            .await;
-    }
+        if remaining.is_empty() {
+            Ok(())
+        } else {
+            let remaining_groups = fix::group_errors_by_check(&post_results);
+            let unfixable = remaining
+                .iter()
+                .filter(|res| !remaining_groups.contains_key(&res.check.name))
+                .count();
 
-    // Re-run checks once after fixes
-    let post_results = runner::run_checks(
-        &cfg,
-        &filters,
-        cli.force,
-        workers,
-        cli.quiet,
-        ui_tx.clone(),
-        &root,
-    )
-    .await?;
-    let remaining: Vec<_> = post_results
-        .iter()
-        .filter(|res| {
-            res.exit_code != Some(0) || res.annotations.iter().any(|a| gha::is_error_level(a.level))
-        })
-        .collect();
+            if unfixable > 0 {
+                Err(CliError::FixesIncompleteUnfixable {
+                    count: remaining.len(),
+                    unfixable,
+                }
+                .into())
+            } else {
+                Err(CliError::FixesIncomplete {
+                    count: remaining.len(),
+                }
+                .into())
+            }
+        }
+    }
+    .await;
 
     if let Some(tx) = ui_tx {
         let _ = tx.send(ui::UiEvent::Done).await;
     }
     let _ = ui_handle.await;
 
-    if remaining.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("checks still failing after fixes ({})", remaining.len())
-    }
+    result
 }
 
-fn effective_workers(value: usize) -> usize {
-    if value == 0 {
-        num_cpus::get().max(1)
-    } else {
-        value
-    }
-}
-
-fn compute_root(cli: &Cli, config_path: &PathBuf) -> Result<PathBuf> {
+fn compute_root(cli: &Cli, config_path: &Path) -> Result<PathBuf> {
     if let Some(root) = &cli.root {
         if !root.exists() {
-            anyhow::bail!("--root path does not exist: {}", root.display());
+            return Err(CliError::RootNotFound(root.clone()).into());
         }
         if !root.is_dir() {
-            anyhow::bail!("--root must be a directory: {}", root.display());
+            return Err(CliError::RootNotDirectory(root.clone()).into());
         }
         return Ok(root.clone());
     }
 
-    if let Some(parent) = config_path.parent() {
-        if parent.exists() {
-            return Ok(parent.to_path_buf());
-        }
+    if let Some(parent) = config_path.parent()
+        && parent.exists()
+    {
+        return Ok(parent.to_path_buf());
     }
 
     std::env::current_dir().context("failed to determine current directory")

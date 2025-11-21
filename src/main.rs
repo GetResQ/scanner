@@ -2,8 +2,10 @@ mod agents;
 mod cli;
 mod config;
 mod demo;
+mod error;
 mod fix;
 mod gha;
+mod pool;
 mod process;
 mod runner;
 mod ui;
@@ -43,9 +45,17 @@ pub struct Cli {
     #[arg(long)]
     no_fix: bool,
 
-    /// Disable interactive TUI and emit plain logs
+    /// Disable colors and spinners (plain text output)
     #[arg(long)]
     quiet: bool,
+
+    /// Enable interactive TUI (experimental)
+    #[arg(long)]
+    tui: bool,
+
+    /// Show verbose output including streaming from checks and agents
+    #[arg(short = 'v', long)]
+    verbose: bool,
 
     /// Agent to use for analyzer/fixer (codex|claude). Overrides config agents.
     #[arg(long, value_parser = ["codex", "claude"])]
@@ -55,7 +65,7 @@ pub struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// Model name for the selected agent (e.g. gpt-5.1-codex-mini, gpt-5-codex, sonnet, opus)
+    /// Model name for the selected agent (e.g. gpt-5.1-codex-max, gpt-5-codex, sonnet, opus)
     #[arg(short = 'm', long)]
     model: Option<String>,
 
@@ -67,4 +77,22 @@ pub struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     cli::run(cli).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_quiet_flag() {
+        let cli = Cli::try_parse_from(["scanner", "--quiet"]).expect("parse");
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn cli_rejects_removed_plain_flag() {
+        let err = Cli::try_parse_from(["scanner", "--plain"]).expect_err("expected parse error");
+        assert!(err.to_string().contains("--plain"));
+    }
 }

@@ -10,6 +10,10 @@ pub enum AnnotationLevel {
 #[derive(Debug, Clone)]
 pub struct Annotation {
     pub level: AnnotationLevel,
+    /// Whether this annotation represents an actionable tool-reported issue that
+    /// should be sent to the fixer agent. Synthetic annotations (e.g. "no GitHub
+    /// Actions annotations produced") should set this to false.
+    pub actionable: bool,
     pub file: Option<PathBuf>,
     pub line: Option<u64>,
     pub end_line: Option<u64>,
@@ -71,6 +75,7 @@ pub fn parse_annotation_line(line: &str) -> Option<Annotation> {
 
     Some(Annotation {
         level,
+        actionable: true,
         file,
         line: line_no,
         end_line,
@@ -91,4 +96,94 @@ pub fn parse_annotations(output: &str) -> Vec<Annotation> {
 
 pub fn is_error_level(level: AnnotationLevel) -> bool {
     matches!(level, AnnotationLevel::Error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_error_annotation() {
+        let line = "::error file=app.js,line=10::Missing semicolon";
+        let ann = parse_annotation_line(line).unwrap();
+        assert_eq!(ann.level, AnnotationLevel::Error);
+        assert!(ann.actionable);
+        assert_eq!(ann.file, Some(PathBuf::from("app.js")));
+        assert_eq!(ann.line, Some(10));
+        assert_eq!(ann.message, "Missing semicolon");
+    }
+
+    #[test]
+    fn parse_warning_annotation() {
+        let line = "::warning file=src/lib.rs,line=42,col=5::Unused variable";
+        let ann = parse_annotation_line(line).unwrap();
+        assert_eq!(ann.level, AnnotationLevel::Warning);
+        assert!(ann.actionable);
+        assert_eq!(ann.file, Some(PathBuf::from("src/lib.rs")));
+        assert_eq!(ann.line, Some(42));
+        assert_eq!(ann.column, Some(5));
+        assert_eq!(ann.message, "Unused variable");
+    }
+
+    #[test]
+    fn parse_notice_annotation() {
+        let line = "::notice::Build completed";
+        let ann = parse_annotation_line(line).unwrap();
+        assert_eq!(ann.level, AnnotationLevel::Notice);
+        assert!(ann.actionable);
+        assert_eq!(ann.file, None);
+        assert_eq!(ann.message, "Build completed");
+    }
+
+    #[test]
+    fn parse_annotation_with_title() {
+        let line = "::error file=test.rs,line=1,title=E0001::Type mismatch";
+        let ann = parse_annotation_line(line).unwrap();
+        assert_eq!(ann.title, Some("E0001".to_string()));
+        assert_eq!(ann.message, "Type mismatch");
+    }
+
+    #[test]
+    fn parse_annotation_with_end_line() {
+        let line = "::error file=test.rs,line=10,endLine=15::Multi-line error";
+        let ann = parse_annotation_line(line).unwrap();
+        assert_eq!(ann.line, Some(10));
+        assert_eq!(ann.end_line, Some(15));
+    }
+
+    #[test]
+    fn parse_ignores_non_annotation_lines() {
+        assert!(parse_annotation_line("regular output").is_none());
+        assert!(parse_annotation_line(":: not valid").is_none());
+        assert!(parse_annotation_line("::unknown::message").is_none());
+    }
+
+    #[test]
+    fn parse_case_insensitive_level() {
+        assert!(parse_annotation_line("::ERROR::msg").is_some());
+        assert!(parse_annotation_line("::Warning::msg").is_some());
+        assert!(parse_annotation_line("::NOTICE::msg").is_some());
+    }
+
+    #[test]
+    fn parse_annotations_multiple_lines() {
+        let output = r#"
+Building project...
+::error file=a.rs,line=1::Error one
+Some other output
+::warning file=b.rs,line=2::Warning one
+Done.
+"#;
+        let anns = parse_annotations(output);
+        assert_eq!(anns.len(), 2);
+        assert_eq!(anns[0].level, AnnotationLevel::Error);
+        assert_eq!(anns[1].level, AnnotationLevel::Warning);
+    }
+
+    #[test]
+    fn is_error_level_works() {
+        assert!(is_error_level(AnnotationLevel::Error));
+        assert!(!is_error_level(AnnotationLevel::Warning));
+        assert!(!is_error_level(AnnotationLevel::Notice));
+    }
 }

@@ -2,11 +2,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::pool::Pool;
 use crate::ui;
 
 pub async fn run_demo(use_tui: bool) -> Result<()> {
-    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui);
-    let checks = vec![
+    // Create a demo pool
+    let pool = Pool::new(4);
+    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, true, false, pool.clone());
+
+    let checks = [
         ("rust-lint", "Run clippy on workspace"),
         ("rust-test", "Run unit tests"),
         ("fmt", "Check formatting"),
@@ -22,7 +26,9 @@ pub async fn run_demo(use_tui: bool) -> Result<()> {
         let tx = ui_tx.clone();
         let sleep_ms = 600 + (idx as u64 * 450);
         let fail = idx % 4 == 3; // make some failures
-        handles.push(tokio::spawn(async move {
+
+        // Use the pool to schedule tasks
+        handles.push(pool.spawn(async move {
             if let Some(tx) = tx.as_ref() {
                 let _ = tx
                     .send(ui::UiEvent::CheckStarted {
