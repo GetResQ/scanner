@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use which::which;
 
 use crate::Cli;
 use crate::config;
 use crate::config::Agent;
 use crate::config::CommandSpec;
+use crate::error::AgentError;
 
 pub fn resolve_agent(role: &str, cli: &Cli, cfg: &config::Config) -> Result<Agent> {
     // CLI overrides config; if CLI agent is set, synthesize it.
@@ -22,7 +23,10 @@ pub fn resolve_agent(role: &str, cli: &Cli, cfg: &config::Config) -> Result<Agen
     if let Some(agent) = agent_opt {
         return Ok(agent.clone());
     }
-    anyhow::bail!("no {role} agent configured; specify --agent or agents.{role} in config");
+    Err(AgentError::NotConfigured {
+        role: role.to_string(),
+    }
+    .into())
 }
 
 fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str) -> Result<Agent> {
@@ -30,12 +34,16 @@ fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str
     let (binary, default_model) = match kind.as_str() {
         "codex" => ("codex", "gpt-5.1-codex-mini"),
         "claude" => ("claude", "sonnet"),
-        _ => anyhow::bail!("unsupported agent: {agent_name}"),
+        _ => {
+            return Err(AgentError::UnsupportedType(agent_name.to_string()).into());
+        }
     };
 
     let model = model_override.unwrap_or_else(|| default_model.to_string());
 
-    let path = which(binary).with_context(|| format!("{binary} executable not found in PATH"))?;
+    let path = which(binary).map_err(|_| AgentError::BinaryNotFound {
+        binary: binary.to_string(),
+    })?;
 
     let mut args = vec![
         "exec".to_string(),

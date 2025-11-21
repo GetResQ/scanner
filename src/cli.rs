@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use atty;
-use num_cpus;
 
 use crate::Cli;
 use crate::agents::resolve_agent;
 use crate::config;
 use crate::demo;
+use crate::error::{CliError, ConfigError};
 use crate::fix;
 use crate::gha;
+use crate::pool::Pool;
 use crate::runner;
 use crate::ui;
 
@@ -43,11 +44,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         PathBuf::from("scanner.toml")
     };
 
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| ConfigError::ReadFailed {
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
 
-    let cfg = config::Config::from_toml(&raw)
-        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    let cfg = config::Config::from_toml(&raw).map_err(|e| ConfigError::ParseFailed {
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
 
     let root = compute_root(&cli, &config_path)?;
 
@@ -57,21 +62,30 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Demo { .. }) => unreachable!(),
     };
 
-    let workers = effective_workers(cli.workers);
+    // Create the shared pool
+    let pool = Pool::new(cli.workers);
 
     let use_tui = !cli.quiet && atty::is(atty::Stream::Stdout);
-    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui);
+    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, pool.clone());
 
     let check_results = runner::run_checks(
         &cfg,
         &filters,
         cli.force,
-        workers,
+        &pool,
         cli.quiet,
         ui_tx.clone(),
         &root,
     )
-    .await?;
+    .await;
+
+    if check_results.is_empty() {
+        if let Some(tx) = ui_tx {
+            let _ = tx.send(ui::UiEvent::Done).await;
+        }
+        let _ = ui_handle.await;
+        return Err(CliError::NoMatchingChecks { filters }.into());
+    }
 
     let failures: Vec<_> = check_results
         .iter()
@@ -94,76 +108,54 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         let _ = ui_handle.await;
         let reason = if cli.dry_run { "dry-run" } else { "no-fix" };
-        anyhow::bail!("checks failed ({}; no fixes attempted)", reason);
+        return Err(CliError::ChecksFailed {
+            count: failures.len(),
+            reason: reason.to_string(),
+        }
+        .into());
     }
 
     let analyzer = resolve_agent("analyzer", &cli, &cfg)?;
     let fixer = resolve_agent("fixer", &cli, &cfg)?;
 
-    let error_groups = fix::group_errors(&check_results);
-    if error_groups.is_empty() {
-        anyhow::bail!("checks failed but no actionable error groups were produced");
+    // Group errors by check type
+    let errors_by_check = fix::group_errors_by_check(&check_results);
+    if errors_by_check.is_empty() {
+        if let Some(tx) = ui_tx {
+            let _ = tx.send(ui::UiEvent::Done).await;
+        }
+        let _ = ui_handle.await;
+        return Err(CliError::ChecksFailed {
+            count: failures.len(),
+            reason: "no actionable error groups".to_string(),
+        }
+        .into());
     }
 
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckStarted {
-                name: "analyzer".into(),
-                desc: Some("Analyze failures".into()),
-            })
-            .await;
-    }
-    let analysis = fix::run_analyzer(&analyzer, &error_groups, &root).await?;
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckFinished {
-                name: "analyzer".into(),
-                success: true,
-                message: "done".into(),
-                output: Some(analysis.clone()),
-            })
-            .await;
-    }
-
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckStarted {
-                name: "fixer".into(),
-                desc: Some("Apply fixes".into()),
-            })
-            .await;
-    }
-    fix::run_fixer_batches(
+    // Run the fix pipeline: each check gets its own analyzer -> fixer(s)
+    fix::run_fix_pipeline(
+        &analyzer,
         &fixer,
-        &analysis,
-        &error_groups,
+        &errors_by_check,
         cli.batch_size,
-        workers,
+        &pool,
         &root,
+        ui_tx.clone(),
     )
     .await?;
-    if let Some(tx) = ui_tx.clone() {
-        let _ = tx
-            .send(ui::UiEvent::CheckFinished {
-                name: "fixer".into(),
-                success: true,
-                message: "applied".into(),
-                output: Some("Applied fixes.".into()),
-            })
-            .await;
-    }
 
     // Re-run checks once after fixes
     let post_results = runner::run_checks(
         &cfg,
         &filters,
         cli.force,
-        workers,
+        &pool,
         cli.quiet,
         ui_tx.clone(),
         &root,
     )
-    .await?;
+    .await;
+
     let remaining: Vec<_> = post_results
         .iter()
         .filter(|res| {
@@ -179,25 +171,20 @@ pub async fn run(cli: Cli) -> Result<()> {
     if remaining.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("checks still failing after fixes ({})", remaining.len())
-    }
-}
-
-fn effective_workers(value: usize) -> usize {
-    if value == 0 {
-        num_cpus::get().max(1)
-    } else {
-        value
+        Err(CliError::FixesIncomplete {
+            count: remaining.len(),
+        }
+        .into())
     }
 }
 
 fn compute_root(cli: &Cli, config_path: &PathBuf) -> Result<PathBuf> {
     if let Some(root) = &cli.root {
         if !root.exists() {
-            anyhow::bail!("--root path does not exist: {}", root.display());
+            return Err(CliError::RootNotFound(root.clone()).into());
         }
         if !root.is_dir() {
-            anyhow::bail!("--root must be a directory: {}", root.display());
+            return Err(CliError::RootNotDirectory(root.clone()).into());
         }
         return Ok(root.clone());
     }
