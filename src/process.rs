@@ -42,7 +42,7 @@ pub async fn run_command_streaming(
         .stdin(if wants_stdin {
             Stdio::piped()
         } else {
-            Stdio::null()
+            Stdio::inherit()
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

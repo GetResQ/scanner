@@ -32,7 +32,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Demo mode exits early
     if let Some(Command::Demo { quiet }) = &cli.command {
         let use_tui = !quiet && atty::is(atty::Stream::Stdout);
-        return demo::run_demo(use_tui).await;
+        let use_color = !cli.quiet && atty::is(atty::Stream::Stderr);
+        return demo::run_demo(use_tui, use_color).await;
     }
 
     let config_path = if let Some(cfg) = &cli.config {
@@ -70,6 +71,44 @@ pub async fn run(cli: Cli) -> Result<()> {
     let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, use_color, verbose, pool.clone());
 
     let result: Result<()> = async {
+        // Run setup commands first (sequentially)
+        for setup in &cfg.setup {
+            if let Some(tx) = ui_tx.as_ref() {
+                let _ = tx
+                    .send(ui::UiEvent::CheckStarted {
+                        name: format!("setup:{}", setup.name),
+                        desc: Some("Setting up".to_string()),
+                    })
+                    .await;
+            }
+
+            let exit_code = runner::run_setup(setup, &root, ui_tx.clone()).await;
+
+            let success = exit_code == Some(0);
+            if let Some(tx) = ui_tx.as_ref() {
+                let _ = tx
+                    .send(ui::UiEvent::CheckFinished {
+                        name: format!("setup:{}", setup.name),
+                        success,
+                        message: if success {
+                            "done".to_string()
+                        } else {
+                            format!("exit {exit_code:?}")
+                        },
+                        output: None,
+                    })
+                    .await;
+            }
+
+            if !success {
+                return Err(CliError::SetupFailed {
+                    name: setup.name.clone(),
+                    exit_code,
+                }
+                .into());
+            }
+        }
+
         let check_results = runner::run_checks(
             &cfg,
             &filters,

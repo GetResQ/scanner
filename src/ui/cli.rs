@@ -70,6 +70,13 @@ fn cprint(style: Style, color: Color, text: &str) {
     }
 }
 
+/// ASCII art logo displayed at startup.
+const LOGO: &str = r#"
+┏━━        ━━┓
+   scanner
+┗━━        ━━┛
+"#;
+
 /// Run the CLI output loop (non-TUI mode).
 pub async fn run_cli(mut rx: Receiver<UiEvent>, use_color: bool, verbose: bool) {
     let style = if use_color {
@@ -77,6 +84,13 @@ pub async fn run_cli(mut rx: Receiver<UiEvent>, use_color: bool, verbose: bool) 
     } else {
         Style::plain()
     };
+
+    // Print logo banner when colors are enabled
+    if style.color {
+        cprint(style, Color::Cyan, LOGO);
+        eprintln!();
+    }
+
     let mut running: HashSet<String> = HashSet::new();
     let mut spinner_tick: usize = 0;
     let mut cursor_hidden = false;

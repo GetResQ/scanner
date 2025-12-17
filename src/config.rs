@@ -7,6 +7,19 @@ use serde::Deserialize;
 use crate::error::ConfigError;
 
 #[derive(Debug, Deserialize)]
+struct RawSetup {
+    #[serde(default)]
+    name: Option<String>,
+    command: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawCheck {
     name: String,
     command: Vec<String>,
@@ -50,6 +63,8 @@ pub struct RawAgents {
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
+    setup: Vec<RawSetup>,
+    #[serde(default)]
     checks: Vec<RawCheck>,
     #[serde(default)]
     agents: RawAgents,
@@ -59,6 +74,16 @@ struct RawConfig {
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+}
+
+/// A setup command that runs before checks.
+#[derive(Debug, Clone)]
+pub struct Setup {
+    pub name: String,
+    pub command: CommandSpec,
+    pub env: HashMap<String, String>,
+    pub timeout: Option<Duration>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +117,7 @@ pub struct Agents {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub setup: Vec<Setup>,
     pub checks: Vec<Check>,
     pub agents: Agents,
 }
@@ -99,8 +125,37 @@ pub struct Config {
 impl Config {
     pub fn from_toml(input: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(input)?;
-        let mut checks = Vec::new();
 
+        // Parse setup commands
+        let mut setup = Vec::new();
+        for (idx, raw_setup) in raw.setup.into_iter().enumerate() {
+            if raw_setup.command.is_empty() {
+                return Err(ConfigError::EmptySetupCommand {
+                    name: raw_setup
+                        .name
+                        .unwrap_or_else(|| format!("setup[{}]", idx)),
+                }
+                .into());
+            }
+
+            let name = raw_setup
+                .name
+                .unwrap_or_else(|| raw_setup.command[0].clone());
+
+            setup.push(Setup {
+                name,
+                command: CommandSpec {
+                    program: raw_setup.command[0].clone(),
+                    args: raw_setup.command[1..].to_vec(),
+                },
+                env: raw_setup.env,
+                timeout: raw_setup.timeout.map(Duration::from_secs),
+                cwd: raw_setup.cwd,
+            });
+        }
+
+        // Parse checks
+        let mut checks = Vec::new();
         for raw_check in raw.checks {
             if raw_check.command.is_empty() {
                 return Err(ConfigError::EmptyCommand {
@@ -178,7 +233,7 @@ impl Config {
                 .transpose()?,
         };
 
-        Ok(Config { checks, agents })
+        Ok(Config { setup, checks, agents })
     }
 }
 
@@ -385,5 +440,49 @@ command = ["cargo", "test"]
         let toml = "this is not valid toml {{{{";
         let result = Config::from_toml(toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_setup_commands() {
+        let toml = r#"
+[[setup]]
+name = "install-deps"
+command = ["bun", "install"]
+timeout = 60
+cwd = "./frontend"
+
+[[setup]]
+command = ["cargo", "fetch"]
+
+[[checks]]
+name = "lint"
+command = ["cargo", "clippy"]
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.setup.len(), 2);
+
+        let setup0 = &config.setup[0];
+        assert_eq!(setup0.name, "install-deps");
+        assert_eq!(setup0.command.program, "bun");
+        assert_eq!(setup0.command.args, vec!["install"]);
+        assert_eq!(setup0.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(setup0.cwd, Some("./frontend".to_string()));
+
+        // Second setup uses command[0] as default name
+        let setup1 = &config.setup[1];
+        assert_eq!(setup1.name, "cargo");
+        assert_eq!(setup1.command.program, "cargo");
+    }
+
+    #[test]
+    fn empty_setup_command_fails() {
+        let toml = r#"
+[[setup]]
+name = "bad"
+command = []
+"#;
+        let result = Config::from_toml(toml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("setup"));
     }
 }

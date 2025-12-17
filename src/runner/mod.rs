@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 
-use crate::config::Check;
+use crate::config::{Check, Config, Setup};
 use crate::gha::{Annotation, AnnotationLevel, is_error_level};
 use crate::pool::Pool;
 use crate::ui::{UiEvent, sanitize_text_for_tui};
@@ -15,7 +15,28 @@ mod selection;
 
 pub use execution::CheckResult;
 
-use crate::config::Config;
+/// Run a setup command. Returns the exit code.
+pub async fn run_setup(
+    setup: &Setup,
+    root: &std::path::Path,
+    ui_tx: Option<Sender<UiEvent>>,
+) -> Option<i32> {
+    let result = process_runner::run_process_streaming(
+        &setup.command,
+        &setup.env,
+        setup.timeout,
+        root,
+        setup.cwd.as_ref(),
+        Some(format!("setup:{}", setup.name)),
+        ui_tx,
+    )
+    .await;
+
+    match result {
+        Ok((exit_code, _output)) => exit_code,
+        Err(_) => None,
+    }
+}
 
 /// Synthesize a failing CheckResult for checks that failed to execute.
 /// This ensures misconfigured checks (binary not found, spawn failure, etc.)
@@ -106,6 +127,16 @@ pub async fn run_checks(
                 Ok(res) => res,
                 Err(err) => {
                     let error_msg = format!("{err:#}");
+                    // Stream the error so it shows in verbose mode
+                    if let Some(tx) = ui_tx.as_ref() {
+                        let _ = tx
+                            .send(UiEvent::StreamLine {
+                                source: check_clone.name.clone(),
+                                stream: crate::ui::StreamType::Stderr,
+                                line: error_msg.clone(),
+                            })
+                            .await;
+                    }
                     synthesize_failed_result(check_clone.clone(), &error_msg)
                 }
             };

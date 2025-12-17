@@ -55,6 +55,10 @@ pub enum ConfigError {
     /// An agent has an empty command.
     #[error("{role} agent must define a non-empty command")]
     EmptyAgentCommand { role: String },
+
+    /// A setup step has an empty command.
+    #[error("setup '{name}' must define a non-empty command")]
+    EmptySetupCommand { name: String },
 }
 
 /// Errors related to agent resolution.
@@ -87,6 +91,10 @@ pub enum CliError {
     /// The specified root path is not a directory.
     #[error("--root must be a directory: {0}")]
     RootNotDirectory(PathBuf),
+
+    /// A setup command failed.
+    #[error("setup '{name}' failed with exit code {exit_code:?}")]
+    SetupFailed { name: String, exit_code: Option<i32> },
 
     /// Checks failed and no fixes were attempted.
     #[error("{count} check(s) failed ({reason}; no fixes attempted)")]

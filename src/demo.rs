@@ -5,10 +5,10 @@ use anyhow::Result;
 use crate::pool::Pool;
 use crate::ui;
 
-pub async fn run_demo(use_tui: bool) -> Result<()> {
+pub async fn run_demo(use_tui: bool, use_color: bool) -> Result<()> {
     // Create a demo pool
     let pool = Pool::new(4);
-    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, true, false, pool.clone());
+    let (ui_tx, ui_handle) = ui::spawn_ui(use_tui, use_color, false, pool.clone());
 
     let checks = [
         ("rust-lint", "Run clippy on workspace"),

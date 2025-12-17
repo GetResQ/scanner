@@ -58,6 +58,7 @@ mod tests {
 
     fn make_config(checks: Vec<Check>) -> Config {
         Config {
+            setup: Vec::new(),
             checks,
             agents: Default::default(),
         }
