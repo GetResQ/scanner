@@ -60,6 +60,7 @@ mod tests {
         Config {
             setup: Vec::new(),
             checks,
+            agent: None,
             agents: Default::default(),
         }
     }

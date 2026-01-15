@@ -11,7 +11,7 @@ pub enum AnnotationLevel {
 pub struct Annotation {
     pub level: AnnotationLevel,
     /// Whether this annotation represents an actionable tool-reported issue that
-    /// should be sent to the fixer agent. Synthetic annotations (e.g. "no GitHub
+    /// should be sent to the solver agent. Synthetic annotations (e.g. "no GitHub
     /// Actions annotations produced") should set this to false.
     pub actionable: bool,
     pub file: Option<PathBuf>,

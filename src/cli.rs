@@ -139,17 +139,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
 
-        if cli.dry_run || cli.no_fix {
-            let reason = if cli.dry_run { "dry-run" } else { "no-fix" };
+        if cli.dry_run {
             return Err(CliError::ChecksFailed {
                 count: failures.len(),
-                reason: reason.to_string(),
+                reason: "dry-run".to_string(),
             }
             .into());
         }
 
-        let analyzer = resolve_agent("analyzer", &cli, &cfg)?;
-        let fixer = resolve_agent("fixer", &cli, &cfg)?;
+        let agent = resolve_agent(&cli, &cfg)?;
 
         // Group errors by check type
         let errors_by_check = fix::group_errors_by_check(&check_results);
@@ -161,12 +159,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             .into());
         }
 
-        // Run the fix pipeline: each check gets its own analyzer -> fixer(s)
+        // Run the solve pipeline: each check gets a single agent run
         fix::run_fix_pipeline(
-            &analyzer,
-            &fixer,
+            &agent,
             &errors_by_check,
-            cli.batch_size,
             &pool,
             &root,
             ui_tx.clone(),

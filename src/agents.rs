@@ -5,31 +5,30 @@ use which::which;
 
 use crate::Cli;
 use crate::config;
-use crate::config::Agent;
-use crate::config::CommandSpec;
+use crate::config::{Agent, CommandSpec};
 use crate::error::AgentError;
 
-pub fn resolve_agent(role: &str, cli: &Cli, cfg: &config::Config) -> Result<Agent> {
+pub fn resolve_agent(cli: &Cli, cfg: &config::Config) -> Result<Agent> {
     // CLI overrides config; if CLI agent is set, synthesize it.
     if let Some(agent_name) = &cli.agent {
-        return synthesize_agent(agent_name, cli.model.clone(), role);
+        return synthesize_agent(agent_name, cli.model.clone());
     }
-    // Otherwise pull from role-specific config.
-    let agent_opt = match role {
-        "analyzer" => cfg.agents.analyzer.as_ref(),
-        "fixer" => cfg.agents.fixer.as_ref(),
-        _ => None,
-    };
-    if let Some(agent) = agent_opt {
+
+    // Prefer the unified agent config if present, then fall back to legacy roles.
+    if let Some(agent) = cfg.agent.as_ref() {
         return Ok(agent.clone());
     }
-    Err(AgentError::NotConfigured {
-        role: role.to_string(),
+    if let Some(agent) = cfg.agents.fixer.as_ref() {
+        return Ok(agent.clone());
     }
-    .into())
+    if let Some(agent) = cfg.agents.analyzer.as_ref() {
+        return Ok(agent.clone());
+    }
+
+    Err(AgentError::NotConfigured.into())
 }
 
-fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str) -> Result<Agent> {
+fn synthesize_agent(agent_name: &str, model_override: Option<String>) -> Result<Agent> {
     let kind = agent_name.to_ascii_lowercase();
     let (binary, default_model) = match kind.as_str() {
         "codex" => ("codex", "gpt-5.1-codex-max"),
@@ -48,8 +47,9 @@ fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str
 
     let args = match kind.as_str() {
         "codex" => {
-            let mut args = vec![
+            let args = vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--model".to_string(),
                 model,
                 "-c".to_string(),
@@ -58,14 +58,10 @@ fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str
                 "--skip-git-repo-check".to_string(),
                 "-".to_string(),
             ];
-            if role == "fixer" {
-                // For fixing we need non-interactive tool execution.
-                args.insert(1, "--dangerously-bypass-approvals-and-sandbox".to_string());
-            }
             args
         }
         "claude" => {
-            let mut args = vec![
+            let args = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "text".to_string(),
@@ -74,21 +70,10 @@ fn synthesize_agent(agent_name: &str, model_override: Option<String>, role: &str
                 "--no-session-persistence".to_string(),
                 "--model".to_string(),
                 model,
+                "--dangerously-skip-permissions".to_string(),
+                "--tools".to_string(),
+                "default".to_string(),
             ];
-
-            if role == "fixer" {
-                args.push("--dangerously-skip-permissions".to_string());
-                args.push("--tools".to_string());
-                args.push("default".to_string());
-            } else {
-                // Analyzer should not modify the workspace.
-                args.push("--tools".to_string());
-                args.push("Read".to_string());
-                // Avoid interactive permission prompts in non-interactive mode.
-                args.push("--permission-mode".to_string());
-                args.push("bypassPermissions".to_string());
-            }
-
             args
         }
         _ => unreachable!("validated above"),

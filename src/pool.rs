@@ -21,7 +21,7 @@ pub struct PoolStats {
 
 /// A fixed-size thread pool backed by a tokio semaphore.
 ///
-/// All jobs (checks, analyzers, fixers) share this pool. When all slots are
+/// All jobs (checks, solvers) share this pool. When all slots are
 /// occupied, new jobs wait until a slot becomes available.
 #[derive(Clone)]
 pub struct Pool {

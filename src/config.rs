@@ -67,6 +67,8 @@ struct RawConfig {
     #[serde(default)]
     checks: Vec<RawCheck>,
     #[serde(default)]
+    agent: Option<RawAgent>,
+    #[serde(default)]
     agents: RawAgents,
 }
 
@@ -119,6 +121,7 @@ pub struct Agents {
 pub struct Config {
     pub setup: Vec<Setup>,
     pub checks: Vec<Check>,
+    pub agent: Option<Agent>,
     pub agents: Agents,
 }
 
@@ -220,6 +223,11 @@ impl Config {
             });
         }
 
+        let agent = raw
+            .agent
+            .map(|agent| Self::convert_agent("agent", agent))
+            .transpose()?;
+
         let agents = Agents {
             analyzer: raw
                 .agents
@@ -233,7 +241,12 @@ impl Config {
                 .transpose()?,
         };
 
-        Ok(Config { setup, checks, agents })
+        Ok(Config {
+            setup,
+            checks,
+            agent,
+            agents,
+        })
     }
 }
 
@@ -347,6 +360,7 @@ timeout = 600
 command = ["codex", "exec", "--json", "--apply"]
 "#;
         let config = Config::from_toml(toml).unwrap();
+        assert!(config.agent.is_none());
 
         let analyzer = config.agents.analyzer.as_ref().unwrap();
         assert_eq!(analyzer.command.program, "codex");
@@ -355,6 +369,26 @@ command = ["codex", "exec", "--json", "--apply"]
         let fixer = config.agents.fixer.as_ref().unwrap();
         assert_eq!(fixer.command.program, "codex");
         assert!(fixer.timeout.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_agent() {
+        let toml = r#"
+[[checks]]
+name = "test"
+command = ["cargo", "test"]
+
+[agent]
+command = ["codex", "exec", "--json"]
+timeout = 600
+"#;
+        let config = Config::from_toml(toml).unwrap();
+
+        let agent = config.agent.as_ref().unwrap();
+        assert_eq!(agent.command.program, "codex");
+        assert_eq!(agent.timeout, Some(Duration::from_secs(600)));
+        assert!(config.agents.analyzer.is_none());
+        assert!(config.agents.fixer.is_none());
     }
 
     #[test]
@@ -416,6 +450,21 @@ command = []
     }
 
     #[test]
+    fn empty_solver_command_fails() {
+        let toml = r#"
+[[checks]]
+name = "test"
+command = ["cargo", "test"]
+
+[agent]
+command = []
+"#;
+        let result = Config::from_toml(toml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("agent"));
+    }
+
+    #[test]
     fn default_enabled_is_true() {
         let toml = r#"
 [[checks]]
@@ -431,6 +480,7 @@ command = ["cargo", "test"]
         let toml = "";
         let config = Config::from_toml(toml).unwrap();
         assert!(config.checks.is_empty());
+        assert!(config.agent.is_none());
         assert!(config.agents.analyzer.is_none());
         assert!(config.agents.fixer.is_none());
     }

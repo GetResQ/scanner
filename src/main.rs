@@ -33,17 +33,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     workers: usize,
 
-    /// Batch size for fixer runs (only used during fixing)
-    #[arg(long, default_value_t = 5)]
-    batch_size: usize,
-
     /// Only run checks; do not attempt to fix
     #[arg(long)]
     dry_run: bool,
-
-    /// Skip automatic fixing stage after failed checks
-    #[arg(long)]
-    no_fix: bool,
 
     /// Disable colors and spinners (plain text output)
     #[arg(long)]
@@ -57,7 +49,7 @@ pub struct Cli {
     #[arg(short = 'v', long)]
     verbose: bool,
 
-    /// Agent to use for analyzer/fixer (codex|claude). Overrides config agents.
+    /// Agent to use for solving (codex|claude). Overrides config agent.
     #[arg(long, value_parser = ["codex", "claude"])]
     agent: Option<String>,
 

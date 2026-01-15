@@ -2,8 +2,8 @@
 
 AI-powered project scanner with TUI output and optional automated fixes.
 Scanner uses a set of tools defined by the user to run various automated tests.
-After running these tests, scanner launches concurrent AI agents to diagnose and
-fix problems.
+After running these tests, scanner launches an AI solver per failed check to
+diagnose and fix problems.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ claude login
 
 Once configured, specify which agent to use:
 - Via CLI: `scanner --agent codex` or `scanner --agent claude`
-- Via config: Set `[agents.analyzer]` and `[agents.fixer]` in `scanner.toml`
+- Via config: Set `[agent]` in `scanner.toml`
 
 ### Note:
 All check tools are expected to **return results in GitHub Actions annotation format** (`::error file=X,line=Y::message`). If your tool outputs a different format (e.g., JSON), specify a `formatter` command that converts the output to GHA format.
@@ -55,7 +55,6 @@ cargo install --path .
 
 ## Usage
 - Run scanner: `scanner`
-- Disable fixes: `scanner --no-fix`
 - TUI keys: `↑/↓` move, `y` copy details, `q/esc` exit (double-press while checks run).
 
 ## Configuration

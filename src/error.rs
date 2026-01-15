@@ -21,14 +21,6 @@ pub enum CheckError {
     },
 }
 
-/// Errors that can occur during the fix pipeline.
-#[derive(Debug, Error)]
-pub enum FixError {
-    /// Invalid batch size configuration.
-    #[error("batch size must be greater than 0")]
-    InvalidBatchSize,
-}
-
 /// Errors that can occur during configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -72,9 +64,9 @@ pub enum AgentError {
     #[error("agent binary '{binary}' not found in PATH")]
     BinaryNotFound { binary: String },
 
-    /// No agent configured for the specified role.
-    #[error("no {role} agent configured (use --agent or configure in scanner.toml)")]
-    NotConfigured { role: String },
+    /// No agent configured.
+    #[error("no agent configured (use --agent or configure [agent] in scanner.toml)")]
+    NotConfigured,
 }
 
 /// Errors that can occur during CLI operations.
@@ -147,12 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn fix_error_display() {
-        let err = FixError::InvalidBatchSize;
-        assert_eq!(err.to_string(), "batch size must be greater than 0");
-    }
-
-    #[test]
     fn config_error_display() {
         let err = ConfigError::EmptyCommand {
             name: "test".to_string(),
@@ -181,10 +167,8 @@ mod tests {
 
     #[test]
     fn agent_error_display() {
-        let err = AgentError::NotConfigured {
-            role: "analyzer".to_string(),
-        };
-        assert!(err.to_string().contains("analyzer"));
+        let err = AgentError::NotConfigured;
+        assert!(err.to_string().contains("agent"));
         assert!(err.to_string().contains("configured"));
     }
 }

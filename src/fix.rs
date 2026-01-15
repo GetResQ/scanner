@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc::Sender};
+use tokio::sync::mpsc::Sender;
 
 use crate::config::Agent;
-use crate::error::FixError;
 use crate::gha::{Annotation, AnnotationLevel, is_error_level};
 use crate::pool::Pool;
 use crate::process;
@@ -26,22 +24,13 @@ struct SerializableAnnotation<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct AnalyzerInput<'a> {
+struct SolverInput<'a> {
     task: &'static str,
-    groups: Vec<AnalyzerGroup<'a>>,
+    groups: Vec<SolverGroup<'a>>,
 }
 
 #[derive(Debug, Serialize)]
-struct FixerPrompt<'a> {
-    task: &'static str,
-    check: &'a str,
-    error_type: &'a str,
-    analysis: &'a str,
-    files: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnalyzerGroup<'a> {
+struct SolverGroup<'a> {
     check: &'a str,
     error_type: String,
     files: Vec<String>,
@@ -108,26 +97,22 @@ fn error_key(ann: &Annotation) -> String {
         .unwrap_or_else(|| ann.message.clone())
 }
 
-const ANALYZER_TASK: &str = "\
-Analyze the following build/lint errors. Read the referenced files to understand the code context. \
-Output a concise fix strategy describing how to resolve each error type. \
-Do not modify any files - only analyze and describe the fixes needed.";
+const SOLVER_TASK: &str = "\
+Analyze the following build/lint errors and apply fixes directly in the referenced files. \
+Read the files to understand the code context, then edit them to resolve the errors. \
+Be precise and minimal - only change what is necessary to fix the errors.";
 
-const FIXER_TASK: &str = "\
-Apply the fix strategy from the analysis to resolve the errors in the listed files. \
-Edit each file to fix the errors. Be precise and minimal - only change what is necessary to fix the errors.";
-
-/// Run analyzer for a single check's error groups.
-pub async fn run_analyzer(
+/// Run a solver agent for a single check's error groups.
+pub async fn run_solver(
     agent: &Agent,
     groups: &[ErrorGroup],
     root: &std::path::Path,
 ) -> Result<String> {
-    let input = AnalyzerInput {
-        task: ANALYZER_TASK,
+    let input = SolverInput {
+        task: SOLVER_TASK,
         groups: groups
             .iter()
-            .map(|g| AnalyzerGroup {
+            .map(|g| SolverGroup {
                 check: &g.check,
                 error_type: g.error_type.clone(),
                 files: g.files.clone(),
@@ -157,169 +142,50 @@ pub async fn run_analyzer(
     run_agent_command(agent, &json, root).await
 }
 
-/// Run fixer batches for a single check's error groups.
-///
-/// Each batch is spawned directly on the pool, competing fairly for slots.
-/// This avoids the deadlock issue of nested pool spawns while still respecting
-/// the pool's concurrency limit.
-pub async fn run_fixer_batches(
-    agent: &Agent,
-    analysis_text: &str,
-    groups: &[ErrorGroup],
-    batch_size: usize,
-    pool: &Pool,
-    root: &std::path::Path,
-) -> Result<()> {
-    if batch_size == 0 {
-        return Err(FixError::InvalidBatchSize.into());
-    }
-
-    let file_locks = Arc::new(build_file_locks(groups));
-    let mut handles = Vec::new();
-
-    for group in groups {
-        let batches: Vec<Vec<String>> = group
-            .files
-            .chunks(batch_size)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-
-        for batch in batches {
-            let agent = agent.clone();
-            let analysis = analysis_text.to_string();
-            let check = group.check.to_string();
-            let error_type = group.error_type.clone();
-            let root = root.to_path_buf();
-            let batch_len = batch.len();
-            let file_locks = file_locks.clone();
-
-            // Spawn each batch on the pool - they compete fairly for slots
-            let handle = pool.spawn(async move {
-                let _permits = acquire_file_locks(&file_locks, &batch).await?;
-                let prompt = FixerPrompt {
-                    task: FIXER_TASK,
-                    check: &check,
-                    error_type: &error_type,
-                    analysis: &analysis,
-                    files: batch,
-                };
-                let payload = serde_json::to_vec(&prompt)?;
-                run_agent_command(&agent, &payload, &root)
-                    .await
-                    .with_context(|| {
-                        format!("fixer batch failed for {check}:{error_type} ({batch_len} file(s))")
-                    })?;
-                Ok::<(), anyhow::Error>(())
-            });
-
-            handles.push(handle);
-        }
-    }
-
-    let mut errors = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errors.push(e),
-            Err(join_err) => errors.push(anyhow!("fixer batch panicked: {join_err:?}")),
-        }
-    }
-
-    if !errors.is_empty() {
-        let msg = errors
-            .into_iter()
-            .enumerate()
-            .map(|(idx, e)| format!("{}. {e:#}", idx + 1))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(anyhow!("one or more fixer batches failed:\n{msg}"));
-    }
-
-    Ok(())
-}
-
-fn build_file_locks(groups: &[ErrorGroup]) -> HashMap<String, Arc<Semaphore>> {
-    let mut locks = HashMap::new();
-    for group in groups {
-        for file in &group.files {
-            locks
-                .entry(file.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(1)));
-        }
-    }
-    locks
-}
-
-async fn acquire_file_locks(
-    file_locks: &HashMap<String, Arc<Semaphore>>,
-    files: &[String],
-) -> Result<Vec<OwnedSemaphorePermit>> {
-    let mut files = files.to_vec();
-    files.sort_unstable();
-    files.dedup();
-
-    let mut permits = Vec::with_capacity(files.len());
-    for file in files {
-        let sem = file_locks
-            .get(&file)
-            .ok_or_else(|| anyhow!("missing file lock for '{file}'"))?
-            .clone();
-        permits.push(
-            sem.acquire_owned()
-                .await
-                .map_err(|_| anyhow!("file lock closed unexpectedly for '{file}'"))?,
-        );
-    }
-    Ok(permits)
-}
-
-/// Run the full analyze-then-fix pipeline for all failed checks.
-/// Each check type gets its own analyzer -> fixer(s) sequence.
-///
-/// The pipeline runs in two phases:
-/// 1. All analyzers run in parallel (via pool)
-/// 2. All fixer batches run in parallel (via pool) - batches compete fairly for slots
+/// Run the full solve pipeline for all failed checks.
+/// Each check type gets its own solver run.
 pub async fn run_fix_pipeline(
-    analyzer_agent: &Agent,
-    fixer_agent: &Agent,
+    agent: &Agent,
     errors_by_check: &HashMap<String, Vec<ErrorGroup>>,
-    batch_size: usize,
     pool: &Pool,
     root: &std::path::Path,
     ui_tx: Option<Sender<UiEvent>>,
 ) -> Result<()> {
-    // Phase 1: Run all analyzers in parallel via pool
-    let mut analyzer_handles = Vec::new();
+    let mut handles = Vec::new();
 
     for (check_name, groups) in errors_by_check {
         let check_name = check_name.clone();
         let check_name_for_join = check_name.clone();
         let groups = groups.clone();
-        let agent = analyzer_agent.clone();
+        let agent = agent.clone();
         let root = root.to_path_buf();
         let ui_tx = ui_tx.clone();
 
         let handle = pool.spawn(async move {
-            // Notify UI that analyzer started
             if let Some(tx) = ui_tx.as_ref() {
                 let _ = tx
                     .send(UiEvent::CheckStarted {
-                        name: format!("analyze:{}", check_name),
-                        desc: Some(format!("Analyzing {} errors", check_name)),
+                        name: format!("solve:{}", check_name),
+                        desc: Some(format!("Fixing {} errors", check_name)),
                     })
                     .await;
             }
 
-            let result = run_analyzer(&agent, &groups, &root).await;
+            let result = run_solver(&agent, &groups, &root)
+                .await
+                .with_context(|| format!("solver failed for {check_name}"));
 
-            // Notify UI of result
             if let Some(tx) = ui_tx.as_ref() {
                 let (success, msg, output) = match &result {
-                    Ok(analysis) => (
-                        true,
-                        "done".to_string(),
-                        Some(sanitize_text_for_tui(analysis)),
-                    ),
+                    Ok(text) => {
+                        let trimmed = text.trim();
+                        let output = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(sanitize_text_for_tui(trimmed))
+                        };
+                        (true, "applied".to_string(), output)
+                    }
                     Err(e) => {
                         let text = format!("{e:#}");
                         (false, text.clone(), Some(sanitize_text_for_tui(&text)))
@@ -327,7 +193,7 @@ pub async fn run_fix_pipeline(
                 };
                 let _ = tx
                     .send(UiEvent::CheckFinished {
-                        name: format!("analyze:{}", check_name),
+                        name: format!("solve:{}", check_name),
                         success,
                         message: msg,
                         output,
@@ -335,28 +201,24 @@ pub async fn run_fix_pipeline(
                     .await;
             }
 
-            result.map(|analysis| (check_name, groups, analysis))
+            result.map(|_| ())
         });
 
-        analyzer_handles.push((check_name_for_join, handle));
+        handles.push((check_name_for_join, handle));
     }
 
-    // Collect analyzer results
-    let mut analyses = Vec::new();
     let mut errors = Vec::new();
-    for (check_name, handle) in analyzer_handles {
+    for (check_name, handle) in handles {
         match handle.await {
-            Ok(Ok((check_name, groups, analysis))) => {
-                analyses.push((check_name, groups, analysis));
-            }
-            Ok(Err(e)) => errors.push(e.context(format!("analyzer failed for {check_name}"))),
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(e),
             Err(join_err) => {
-                errors.push(anyhow!("analyzer panicked for {check_name}: {join_err:?}"));
+                errors.push(anyhow!("solver panicked for {check_name}: {join_err:?}"));
                 if let Some(tx) = ui_tx.as_ref() {
                     let msg = format!("panic: {join_err:?}");
                     let _ = tx
                         .send(UiEvent::CheckFinished {
-                            name: format!("analyze:{}", check_name),
+                            name: format!("solve:{}", check_name),
                             success: false,
                             message: "panic".to_string(),
                             output: Some(sanitize_text_for_tui(&msg)),
@@ -364,44 +226,6 @@ pub async fn run_fix_pipeline(
                         .await;
                 }
             }
-        }
-    }
-
-    // Phase 2: Run all fixer batches in parallel via pool
-    // Batches are spawned directly on the pool, competing fairly for slots
-    for (check_name, groups, analysis) in analyses {
-        // Notify UI that fixer started
-        if let Some(tx) = ui_tx.as_ref() {
-            let _ = tx
-                .send(UiEvent::CheckStarted {
-                    name: format!("fix:{}", check_name),
-                    desc: Some(format!("Fixing {} errors", check_name)),
-                })
-                .await;
-        }
-
-        // run_fixer_batches spawns batches directly on the pool
-        let result =
-            run_fixer_batches(fixer_agent, &analysis, &groups, batch_size, pool, root).await;
-
-        // Notify UI of result
-        if let Some(tx) = ui_tx.as_ref() {
-            let (success, msg) = match &result {
-                Ok(()) => (true, "applied".to_string()),
-                Err(e) => (false, format!("{e:#}")),
-            };
-            let _ = tx
-                .send(UiEvent::CheckFinished {
-                    name: format!("fix:{}", check_name),
-                    success,
-                    message: msg,
-                    output: None,
-                })
-                .await;
-        }
-
-        if let Err(e) = result {
-            errors.push(e.context(format!("fixer failed for {check_name}")));
         }
     }
 
@@ -414,7 +238,7 @@ pub async fn run_fix_pipeline(
             .map(|(idx, e)| format!("{}. {e:#}", idx + 1))
             .collect::<Vec<_>>()
             .join("\n");
-        Err(anyhow!("fix pipeline failed:\n{msg}"))
+        Err(anyhow!("solve pipeline failed:\n{msg}"))
     }
 }
 
@@ -451,10 +275,9 @@ async fn run_agent_command(
 mod tests {
     use super::*;
     use crate::config::{Agent, Check, CommandSpec};
+    use crate::pool::Pool;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
         path: PathBuf,
@@ -654,179 +477,29 @@ mod tests {
         assert_eq!(lint_groups[0].files.len(), 2);
     }
 
-    #[test]
-    fn build_file_locks_deduplicates_files_across_groups() {
-        let groups = vec![
-            ErrorGroup {
-                check: "lint".to_string(),
-                error_type: "E1".to_string(),
-                files: vec!["a.rs".to_string(), "b.rs".to_string()],
-                annotations: vec![make_error(Some("a.rs"), Some("E1"), "error")],
-            },
-            ErrorGroup {
-                check: "lint".to_string(),
-                error_type: "E2".to_string(),
-                files: vec!["b.rs".to_string(), "c.rs".to_string()],
-                annotations: vec![make_error(Some("b.rs"), Some("E2"), "error")],
-            },
-        ];
-
-        let locks = build_file_locks(&groups);
-        assert_eq!(locks.len(), 3);
-        assert!(locks.contains_key("a.rs"));
-        assert!(locks.contains_key("b.rs"));
-        assert!(locks.contains_key("c.rs"));
-    }
-
-    #[tokio::test]
-    async fn acquire_file_locks_dedups_duplicate_files_in_batch() {
-        let mut locks = HashMap::new();
-        locks.insert("a.rs".to_string(), Arc::new(Semaphore::new(1)));
-
-        let res = tokio::time::timeout(
-            Duration::from_millis(100),
-            acquire_file_locks(&locks, &["a.rs".to_string(), "a.rs".to_string()]),
-        )
-        .await;
-
-        let permits = res
-            .expect("acquire_file_locks timed out")
-            .expect("expected Ok permits");
-        assert_eq!(permits.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn acquire_file_locks_serializes_overlapping_calls() {
-        let mut locks = HashMap::new();
-        locks.insert("a.rs".to_string(), Arc::new(Semaphore::new(1)));
-        let locks = Arc::new(locks);
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let locks = locks.clone();
-            let active = active.clone();
-            let max_active = max_active.clone();
-            handles.push(tokio::spawn(async move {
-                let _permits = acquire_file_locks(&locks, &["a.rs".to_string()])
-                    .await
-                    .expect("acquire_file_locks");
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                max_active.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-
-        for handle in handles {
-            handle.await.expect("task join");
-        }
-
-        assert_eq!(max_active.load(Ordering::SeqCst), 1);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn fixer_batches_reports_all_failures() {
-        let agent = sh_agent("cat >/dev/null; echo fixer failed >&2; exit 7");
-        let pool = Pool::new(4);
-        let root = TempDir::new("fixer-batches-errors");
+    async fn solve_pipeline_propagates_solver_failures() {
+        let solver = sh_agent("cat >/dev/null; echo solver failed >&2; exit 3");
+        let pool = Pool::new(2);
+        let root = TempDir::new("solve-pipeline-fail");
 
-        let groups = vec![
-            ErrorGroup {
+        let mut errors_by_check = HashMap::new();
+        errors_by_check.insert(
+            "lint".to_string(),
+            vec![ErrorGroup {
                 check: "lint".to_string(),
                 error_type: "E1".to_string(),
                 files: vec!["a.rs".to_string()],
                 annotations: vec![make_error(Some("a.rs"), Some("E1"), "error")],
-            },
-            ErrorGroup {
-                check: "lint".to_string(),
-                error_type: "E2".to_string(),
-                files: vec!["b.rs".to_string()],
-                annotations: vec![make_error(Some("b.rs"), Some("E2"), "error")],
-            },
-        ];
+            }],
+        );
 
-        let err = run_fixer_batches(&agent, "analysis", &groups, 1, &pool, root.path())
+        let err = run_fix_pipeline(&solver, &errors_by_check, &pool, root.path(), None)
             .await
-            .expect_err("expected run_fixer_batches to fail");
-        let msg = err.to_string();
-        assert!(msg.contains("one or more fixer batches failed"));
-        assert!(msg.contains("1."));
-        assert!(msg.contains("2."));
-        assert!(msg.contains("fixer batch failed for lint:E1"));
-        assert!(msg.contains("fixer batch failed for lint:E2"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fix_pipeline_propagates_analyzer_failures() {
-        let analyzer = sh_agent("cat >/dev/null; echo analyzer failed >&2; exit 2");
-        let fixer = sh_agent("cat >/dev/null; exit 0");
-        let pool = Pool::new(2);
-        let root = TempDir::new("fix-pipeline-analyzer-fail");
-
-        let mut errors_by_check = HashMap::new();
-        errors_by_check.insert(
-            "lint".to_string(),
-            vec![ErrorGroup {
-                check: "lint".to_string(),
-                error_type: "E1".to_string(),
-                files: vec!["a.rs".to_string()],
-                annotations: vec![make_error(Some("a.rs"), Some("E1"), "error")],
-            }],
-        );
-
-        let err = run_fix_pipeline(
-            &analyzer,
-            &fixer,
-            &errors_by_check,
-            1,
-            &pool,
-            root.path(),
-            None,
-        )
-        .await
-        .expect_err("expected run_fix_pipeline to fail");
+            .expect_err("expected run_fix_pipeline to fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("fix pipeline failed"));
-        assert!(msg.contains("analyzer failed for lint"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fix_pipeline_propagates_fixer_failures() {
-        let analyzer = sh_agent("cat >/dev/null; echo analysis");
-        let fixer = sh_agent("cat >/dev/null; echo fixer failed >&2; exit 3");
-        let pool = Pool::new(2);
-        let root = TempDir::new("fix-pipeline-fixer-fail");
-
-        let mut errors_by_check = HashMap::new();
-        errors_by_check.insert(
-            "lint".to_string(),
-            vec![ErrorGroup {
-                check: "lint".to_string(),
-                error_type: "E1".to_string(),
-                files: vec!["a.rs".to_string()],
-                annotations: vec![make_error(Some("a.rs"), Some("E1"), "error")],
-            }],
-        );
-
-        let err = run_fix_pipeline(
-            &analyzer,
-            &fixer,
-            &errors_by_check,
-            1,
-            &pool,
-            root.path(),
-            None,
-        )
-        .await
-        .expect_err("expected run_fix_pipeline to fail");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("fix pipeline failed"));
-        assert!(msg.contains("fixer failed for lint"));
+        assert!(msg.contains("solve pipeline failed"));
+        assert!(msg.contains("solver failed for lint"));
     }
 }

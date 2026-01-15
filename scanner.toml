@@ -1,9 +1,6 @@
 # scanner.toml for Rust project
-[agents.analyzer]
-command = ["codex", "exec", "--model", "gpt-5.1-codex-mini", "-c", "model_reasoning_effort=\"medium\"", "--json", "--skip-git-repo-check", "-"]
-
-[agents.fixer]
-command = ["codex", "exec", "--model", "gpt-5.1-codex-mini", "-c", "model_reasoning_effort=\"medium\"", "--dangerously-bypass-approvals-and-sandbox", "--json", "--skip-git-repo-check", "-"]
+[agent]
+command = ["codex", "exec", "--model", "gpt-5.2-codex", "-c", "model_reasoning_effort=\"high\"", "--dangerously-bypass-approvals-and-sandbox", "--json", "--skip-git-repo-check", "-"]
 
 
 [[checks]]
